@@ -8663,7 +8663,8 @@ def _estimate_label_h_px(item: Dict, default_fs: float = 10.0) -> float:
 def resolve_label_positions(labels: List[Dict], y_min: float, y_max: float,
                             chart_height_px: float,
                             min_gap_px: float = MIN_LABEL_GAP_PX,
-                            top_pad_px: float = 2.0, bottom_pad_px: float = 2.0) -> List[Dict]:
+                            top_pad_px: float = 2.0, bottom_pad_px: float = 2.0,
+                            anchor: Optional[Dict] = None) -> List[Dict]:
     """우측 가격 라벨 범용 충돌 회피 — 고가→저가 정렬 + 최소 세로 간격 항상 보장.
 
     매개변수
@@ -8672,6 +8673,8 @@ def resolve_label_positions(labels: List[Dict], y_min: float, y_max: float,
     - y_min / y_max: 최종 렌더링 y축 range (fig.update_yaxes range와 동일 값).
     - chart_height_px: 해당 행 플롯 영역의 실제 픽셀 높이 (bottom→top, px).
     - min_gap_px: 인접 박스 최소 간격 (px, 기본 MIN_LABEL_GAP_PX=12 ≈ 1mm 이상).
+    - anchor: 앵커할 라벨 dict (labels 리스트의 원소 중 하나, 동일 객체). 지정하면 그 박스를
+      실제 가격선 위에 고정하고 나머지 박스는 앵커를 중심으로 위/아래로 정렬 (위 5번).
 
     반환: labels 리스트 그대로(입력 순서 유지, in-place 확장). 각 라벨에 추가:
     - 'label_y'        : 박스 표시 위치의 가격 (데이터 좌표; leader line/호버 실가 표시용)
@@ -8688,6 +8691,12 @@ def resolve_label_positions(labels: List[Dict], y_min: float, y_max: float,
        넘을 수 있음 — 물리적 한계. 상단은 항상 차트 안에 들어온다.)
     4. leader line: annotation 앵커(x/y)는 실제 가격에 고정되어 ay로 박스만 이동해도
        화살표가 항상 실제 가격 점을 가리킨다 (기존 add_price_labels 구조 그대로 유지).
+    5. [v23.28] anchor 모드 (anchor 파라미터 지정 시): anchor 박스(통상 '현재가')는
+       자기 실제 가격선 위에 정확히 고정(yshift=0). 나머지 박스는 anchor의 가격 기준
+       위로/아래로만 정렬 — anchor보다 높은 가격의 박스는 anchor 박스 상단부터 위 방향으로,
+       낮은 가격의 박스는 anchor 박스 하단부터 아래 방향으로 가장 가까운 것이 가장 먼저
+       배치된다. 한쪽 스택이 사용 가능 공간보다 높으면 그쪽 최소 간격만 가변 축소(g_eff)
+       하여 순서·경계는 항상 유지. anchor=None 이면 기존 패킹 경로와 100% 동일.
     """
     if not labels:
         return labels
@@ -8728,6 +8737,70 @@ def resolve_label_positions(labels: List[Dict], y_min: float, y_max: float,
 
     # ── 2) 가격 내림차순 정렬 (고가 → 저가; 동일 가격은 입력 순서 유지) ──
     order = sorted(range(n), key=lambda i: (-rows[i]["y"], i))
+
+    # ── 2b) [LABEL ANCHOR v23.28] 앵커 모드: anchor 박스(통상 '현재가')를 자기 가격선에
+    # 정확히 고정(yshift=0)하고, 나머지 박스는 앵커를 기준으로 위/아래 바깥쪽으로 정렬.
+    # 자연 위치가 앵커·인접 박스에 너무 가까우면 앵커에서 먼 쪽(위 그룹은 위로 / 아래
+    # 그룹은 아래로)으로만 이동. 한쪽 스택이 사용 가능 공간보다 높으면 그쪽의 최소 간격
+    # (g_eff)만 가변 축소하여 채운다 — 순서·경계는 항상 유지, g_eff=0 이 돼도 순서만 보장.
+    anchor_row = None
+    if anchor is not None:
+        for _i in range(n):
+            if rows[_i]["it"] is anchor:
+                anchor_row = _i
+                break
+    if anchor_row is not None:
+        a = anchor_row
+        pos = [0.0] * n
+        pos[a] = rows[a]["px"]  # 앵커 박스: 실제 가격선 위 고정 (yshift=0)
+        pa, ha = pos[a], rows[a]["h"]
+        g = float(min_gap_px)
+        above = [i for i in range(n) if i != a and rows[i]["y"] > rows[a]["y"]]
+        below = [i for i in range(n) if i != a and rows[i]["y"] <= rows[a]["y"]]
+        above.sort(key=lambda i: (rows[i]["y"] - rows[a]["y"], i))   # 앵커에 가까운 것부터
+        below.sort(key=lambda i: (rows[a]["y"] - rows[i]["y"], i))
+        if above:  # 앵커 위(현재가보다 높은 가격): 앵커에서 위로, 아래 박스와 반높이+갭 이상
+            k = len(above)
+            sum_h = sum(rows[i]["h"] for i in above)
+            avail_up = (H - top_pad_px) - (pa + ha / 2.0)
+            g_eff = min(g, max(0.0, avail_up - sum_h) / k)
+            tail = 0.0
+            caps = {}
+            for j in range(k - 1, -1, -1):
+                i = above[j]
+                # j 위의 박스들이 모두 g_eff 간격으로 들어와도 i 중심이 넘어가면 안 되는 상한
+                caps[i] = (H - top_pad_px) - (rows[i]["h"] / 2.0 + tail)
+                tail += g_eff + rows[i]["h"]
+            prev_i = a
+            for i in above:
+                # 정렬 유지: 직전 박스(아래쪽) 중심 − (h/2+h/2) − g_eff 보다 위에 있어야 함
+                cap_need = pos[prev_i] + (rows[prev_i]["h"] + rows[i]["h"]) / 2.0 + g_eff
+                pos[i] = max(min(rows[i]["px"], caps[i]), cap_need)
+                prev_i = i
+        if below:  # 앵커 아래(현재가 이하): 앵커에서 아래로, 위 박스와 반높이+갭 이상
+            m = len(below)
+            sum_h = sum(rows[i]["h"] for i in below)
+            avail_down = (pa - ha / 2.0) - bottom_pad_px
+            g_eff = min(g, max(0.0, avail_down - sum_h) / m)
+            tail = 0.0
+            floors = {}
+            for j in range(m - 1, -1, -1):
+                i = below[j]
+                # j 아래 박스들이 모두 g_eff 간격으로 들어와도 i 중심이 넘지 말아야 하는 하한
+                floors[i] = bottom_pad_px + rows[i]["h"] / 2.0 + tail
+                tail += g_eff + rows[i]["h"]
+            prev_i = a
+            for i in below:
+                # 정렬 유지: 직전 박스(위쪽) 중심 − (h/2+h/2) − g_eff 보다 아래에 있어야 함
+                floor_need = pos[prev_i] - (rows[prev_i]["h"] + rows[i]["h"]) / 2.0 - g_eff
+                pos[i] = min(max(rows[i]["px"], floors[i]), floor_need)
+                prev_i = i
+        for i, r in enumerate(rows):
+            p = pos[i]
+            r["it"]["label_y"] = _px2p(p)
+            r["it"]["yshift"] = int(round(r["px"] - p))
+            r["it"]["_label_pos_px"] = p
+        return labels
 
     # ── 3) 위→아래 패킹 스윕 ──
     pos = [0.0] * n
@@ -9051,7 +9124,7 @@ def build_financial_tooltip_text(label_text: str, price_val: float, cp: float) -
     )
     return hover_html
 
-def add_price_labels(fig, items: List[Dict], y_min: float, y_max: float, row: int = 1, x_pos: float = 1.0, yref_name: Optional[str] = None, exact_y: bool = False, chart_height_px: Optional[float] = None):
+def add_price_labels(fig, items: List[Dict], y_min: float, y_max: float, row: int = 1, x_pos: float = 1.0, yref_name: Optional[str] = None, exact_y: bool = False, chart_height_px: Optional[float] = None, anchor_item: Optional[Dict] = None):
     """우측 값 박스 — v16.3 극한 컴팩트 최종
 
     v16.2 이후에도 겹침이 보인다는 신고로, 박스 위아래 폭을 글자가 가려지지 않는 한도에서 극한으로 축소:
@@ -9102,7 +9175,9 @@ def add_price_labels(fig, items: List[Dict], y_min: float, y_max: float, row: in
         _chart_h_px = 0.0
     if not np.isfinite(_chart_h_px) or _chart_h_px <= 0:
         _chart_h_px = _estimate_row_plot_height_px(fig, row)
-    placed = resolve_label_positions(items, y_min, y_max, _chart_h_px, min_gap_px=_label_gap_px)
+    # [LABEL ANCHOR v23.28] anchor_item 지정 시(메인차트 '현재가'): 해당 박스를 실제
+    # 가격선 위에 고정(yshift=0)하고 나머지 박스는 위/아래로 정렬. 미지정(fib 등) 시 기존 경로.
+    placed = resolve_label_positions(items, y_min, y_max, _chart_h_px, min_gap_px=_label_gap_px, anchor=anchor_item)
     if _has_fib_labels and exact_y:
         # Fib 차트: 라벨을 자신의 수평선 근처(±32px)에 유지 — leader line/호버로 실가 확인
         for p in placed:
@@ -12304,7 +12379,10 @@ def render_main_chart(df, ind, title, show_bb=True, show_sr=True, show_pivot=Tru
             # 실패시 기존 로직 fallback: 모바일만 필터
             if mobile:
                 price_label_items = [it for it in price_label_items if it.get("priority", 5) <= 2]
-        add_price_labels(fig, price_label_items, y_min=_axis_lo, y_max=_axis_hi, row=1, x_pos=1.0, chart_height_px=_row1_h_px)
+        # [LABEL ANCHOR v23.28] 메인차트 현재가 = 배치 기준선: 현재가 박스는 실제
+        # 가격선 위에 정확히 고정되고, 나머지 박스는 현재가를 중심으로 위/아래로 정렬.
+        _anchor_item = next((it for it in price_label_items if "현재가" in str(it.get("text", ""))), None)
+        add_price_labels(fig, price_label_items, y_min=_axis_lo, y_max=_axis_hi, row=1, x_pos=1.0, chart_height_px=_row1_h_px, anchor_item=_anchor_item)
 
     # 전문가형 분석 표식: 추세선·스윙·지지저항존·거래량 폭발·이벤트 콜아웃
     fig = add_expert_technical_overlays(fig, df, ind, main_fib=main_fib, touch_map=touch_map, mobile=mobile, show_sr_overlay=show_sr)
