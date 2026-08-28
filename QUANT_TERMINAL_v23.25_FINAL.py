@@ -9891,32 +9891,65 @@ def build_chart_action_cockpit(df: pd.DataFrame, ind: Dict, main_fib: Optional[D
         else:
             action, color, icon = "중립 관망", P["accent"], "⚪"
             detail = "방향성 확인 후 대응"
-        return {"action": action, "color": color, "icon": icon, "score": float(np.clip(50 + total, 0, 100)), "detail": detail, "reasons": reasons[:4]}
+        return {"action": action, "color": color, "icon": icon, "score": float(np.clip(50 + total, 0, 100)), "detail": detail, "reasons": reasons[:4], "reasons_all": reasons, "bull": int(bull), "bear": int(bear)}
     except Exception as e:
-        return {"action": "판정 보류", "color": P["accent"], "icon": "⚪", "score": 50.0, "detail": str(e), "reasons": []}
+        return {"action": "판정 보류", "color": P["accent"], "icon": "⚪", "score": 50.0, "detail": str(e), "reasons": [], "reasons_all": [], "bull": 0, "bear": 0}
 
 
 
 # [CHART_TITLE_SEARCH_FUNC] 차트제목검색: 메인 차트 / 지금 행동 액션 콕핏
 # [POSFUNC_ACTION_COCKPIT] 지금 행동 박스 위치: add_action_cockpit_annotation() 내부 x/y를 조정합니다.
-def add_action_cockpit_annotation(fig, decision: Dict, x: float = 0.985, y: float = 1.18):
-    """차트 우측 상단에 지금 행동지침을 고정 표시합니다."""
+def add_action_cockpit_annotation(fig, decision: Dict, x: float = 0.985, y: float = 1.18, mobile: bool = False):
+    """차트 우측 상단에 지금 행동지침을 고정 표시합니다.
+
+    [FIX v23.29] (1) 박스 고정 폭(130px)에 맞지 않는 긴 텍스트가 잘리던 문제 →
+    apply_smart_annotation_layout가 이 박스에 콘텐츠 폭 기반 자동 폭을 부여(아래 참조).
+    (2) 다른 박스들처럼 마우스를 올리면 **상세 도움말(hover)** 이 뜨도록 hovertext 추가 —
+    종합점수(강세/약세 분해)·투자 지침·판단 근거 전체·체크리스트 구성까지 표시.
+    """
     try:
-        reasons = " · ".join(decision.get("reasons", [])) or "핵심 지표 혼조"
+        reasons_all = list(decision.get("reasons_all") or decision.get("reasons") or [])
+        # 모바일은 폭이 협소해 보이는 줄은 짧게 (상세는 hover로)
+        reasons_disp = " · ".join((decision.get("reasons") or [])[:2] if mobile else (decision.get("reasons") or [])) or "핵심 지표 혼조"
+        detail_full = esc(decision.get("detail", ""))   # hover에는 항상 전체
+        detail_disp = detail_full
+        if mobile and len(detail_disp) > 18:            # 보이는 박스 줄은 모바일에서 짧게
+            detail_disp = detail_disp[:18] + "…"
         text = (
             f"<b>{decision.get('icon','⚪')} 지금 행동: {esc(decision.get('action','중립'))}</b>"
             f"<br>종합점수 {float(decision.get('score',50)):.0f}/100"
-            f"<br><span style='font-size:10px'>{esc(decision.get('detail',''))}</span>"
-            f"<br><span style='color:#9db4cf;font-size:10px'>{esc(reasons)}</span>"
+            + ("" if mobile else f"<br><span style='font-size:10px'>{detail_disp}</span>")
+            + f"<br><span style='color:#9db4cf;font-size:10px'>{esc(reasons_disp)}</span>"
         )
+
+        # [FIX v23.29] hover 상세도움말 — 박스가 좁아 잘리는 내용(근거 전체·점수 분해)을 hover로 제공
+        bull = int(decision.get("bull", 0)); bear = int(decision.get("bear", 0))
+        color = decision.get("color", P["accent"])
+        if reasons_all:
+            reason_lines = "<br>".join(f" · {esc(r)}" for r in reasons_all)
+        else:
+            reason_lines = " · 핵심 지표 혼조"
+        hover_html = (
+            f"<b><span style='color:{color}'>{decision.get('icon','⚪')} 지금 행동: {esc(decision.get('action','중립'))}</span></b>"
+            f"<br>━━━━━━━━━━━━━━━━━━━━━━━━"
+            f"<br>📊 <b>종합점수 {float(decision.get('score',50)):.0f}/100</b>  (강세 {bull}점 / 약세 {bear}점)"
+            f"<br>📌 <b>투자 지침:</b> {detail_full}"
+            f"<br>💡 <b>판단 근거 (전체 {len(reasons_all)}개):</b>"
+            f"<br>{reason_lines}"
+            f"<br>📖 <b>체크리스트:</b> MA 정/역배열(18) · MACD(14) · SuperTrend(12) · RSI(10) · EMA200(8) · ADX(8) · 거래량(8) · 스퀴즈(5) · MFI(5) — 최신 봉 가중 합산(50±)"
+        )
+
         # [CHART_TITLE_SEARCH: 메인 차트 / 지금 행동 액션 콕핏] 아래 [BOXPOS_009] 박스/풍선 위치 코드입니다. 이 차트 제목으로 검색하면 바로 찾을 수 있습니다.
         # [BOXPOS_009_COMMON_add_action_cockpit_annotation] 공통/메인: 지금 행동 액션 콕핏 박스 | 위치수정: x/y(기준좌표), ax/ay(화살표 박스 픽셀오프셋), xshift/yshift, xanchor/yanchor를 조정. xref/yref="paper"는 0~1 화면비율, xref/yref="x/y"는 날짜·가격/지표값입니다.
         fig.add_annotation(
             x=0.84, y=1.015, xref="paper", yref="paper", text=text,
             showarrow=False, xanchor="right", yanchor="top", align="left",
-            font=dict(size=11, color=decision.get("color", P["accent"]), family=FONT_MONO),
-            bgcolor="rgba(5,9,17,0.95)", bordercolor=decision.get("color", P["accent"]),
+            font=dict(size=11, color=color, family=FONT_MONO),
+            bgcolor="rgba(5,9,17,0.95)", bordercolor=color,
             borderwidth=1.4, borderpad=7, opacity=0.98,
+            hovertext=hover_html,
+            hoverlabel=dict(bgcolor="rgba(13,22,40,0.96)", bordercolor=color,
+                            font=dict(size=11, color="#e2e8f0", family=FONT_MONO)),
         )
     except Exception:
         pass
@@ -10335,6 +10368,24 @@ def apply_smart_annotation_layout(fig, df: Optional[pd.DataFrame] = None, mobile
             padding_step_px = 2 * 4
             box_step_px = TOP_BOX_WIDTH_PX + padding_step_px + TOP_BOX_GAP_PX
 
+            # [FIX v23.29] "지금 행동" 박스는 텍스트가 길어 고정 폭(130px)에서 잘림 →
+            # 가장 긴 줄 기반 콘텐츠 폭으로 자동 조절(데스크톱 최대 460px / 모바일 220px,
+            # 상세는 hover 도움말로 제공). 폭이 다른 박스가 섞이면 누적 폭으로 행 전체를
+            # 다시 중앙 정렬합니다 (동일 폭이면 기존 수식 그대로 유지).
+            per_box_w = [TOP_BOX_WIDTH_PX] * box_count
+            for idx2, (_o2, a2) in enumerate(top_row_boxes):
+                if "지금 행동" in txt(a2):
+                    _w = 14.0  # borderpad 7 × 2
+                    for _line in txt(a2).replace("<br>", "\n").split("\n"):
+                        _plain = re.sub(r"<[^>]+>", "", _line)
+                        _w = max(_w, sum(11.0 if ord(ch) > 0x2E7F else 6.6 for ch in _plain) + 10.0)
+                    per_box_w[idx2] = min(_w, 220.0 if mobile else 460.0)
+
+            custom_w = any(w != TOP_BOX_WIDTH_PX for w in per_box_w)
+            step_extra = padding_step_px + TOP_BOX_GAP_PX
+            if custom_w:
+                total_row_w = sum(per_box_w) + step_extra * (box_count - 1)
+
             for idx, (_, a) in enumerate(top_row_boxes):
                 # 피보나치는 3개 이상, CCI 모바일은 4개 박스를 두 줄로 자동 배치합니다.
                 use_two_rows = (
@@ -10353,12 +10404,21 @@ def apply_smart_annotation_layout(fig, df: Optional[pd.DataFrame] = None, mobile
                     centered_index = idx - ((box_count - 1) / 2.0)
                     row_yshift = 0
 
+                if custom_w and not use_two_rows:
+                    # [FIX v23.29] 폭이 다른 박스: 누적 폭 기반 행 중앙 정렬
+                    left_edge = -total_row_w / 2.0 + sum(per_box_w[:idx]) + step_extra * idx
+                    xshift_px = left_edge + per_box_w[idx] / 2.0
+                    width_px = per_box_w[idx]
+                else:
+                    xshift_px = centered_index * box_step_px
+                    width_px = TOP_BOX_WIDTH_PX
+
                 a.update(
                     xref="paper", yref="paper",
                     x=TOP_ROW_CENTER_X, y=TOP_ROW_Y,
-                    xshift=centered_index * box_step_px,
+                    xshift=xshift_px,
                     yshift=row_yshift,
-                    width=TOP_BOX_WIDTH_PX,
+                    width=width_px,
                     showarrow=False,
                     xanchor="center", yanchor="middle",
                     align="center",
@@ -12528,7 +12588,8 @@ def render_main_chart(df, ind, title, show_bb=True, show_sr=True, show_pivot=Tru
     # 일반 도움말은 hover 표식으로 정리하고, 강력 매수/긴급 매도만 상시 표시
     _callout_x_end = route_callouts_to_right_blank_space(fig, df, ind, mobile=mobile)
 
-    fig = add_action_cockpit_annotation(fig, decision, x=(0.995 if not mobile else 0.985), y=0.985)
+    # [FIX v23.29] mobile 전달 — 박스 폭/표시 줄 조절 + hover 상세도움말
+    fig = add_action_cockpit_annotation(fig, decision, x=(0.995 if not mobile else 0.985), y=0.985, mobile=mobile)
 
     # _h는 라벨 패킹(아래)에서 먼저 사용해야 하므로 정의 위치를 위로 옮김 (값은 동일)
     # [FIX v16.0] 우측 가격 라벨 rail 최종 — 샤프/컴팩트 + 해상도별 자동 최적화
