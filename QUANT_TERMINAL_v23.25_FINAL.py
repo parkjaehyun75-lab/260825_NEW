@@ -3925,6 +3925,32 @@ def _pattern_strategy(pattern: Dict, unit: str = '') -> List[str]:
 
     lines.append(pattern.get('summary', ''))
 
+    # [FIX v23.30] 마스터 통계 + 거래량 시그니처 + 레짐 적합 (v23.30 엔진 출력)
+
+    stat_line = _pattern_stats_line(pattern.get('name', ''))
+
+    if stat_line:
+
+        lines.append(stat_line)
+
+    _st = PATTERN_STATS.get(pattern.get('name', ''))
+
+    if _st and _st.get('vol_rule'):
+
+        lines.append(f"거래량 규칙: {_st['vol_rule']}")
+
+    if pattern.get('vol_label'):
+
+        lines.append(f"현재 거래량 시그니처: {pattern['vol_label']}")
+
+    if pattern.get('regime_label'):
+
+        lines.append(f"레짐 적합: {pattern['regime_label']}")
+
+    if pattern.get('height_label'):
+
+        lines.append(pattern['height_label'])
+
     if bo is not None:
 
         vol_txt = f"돌파봉 거래량은 20봉 평균 대비 {bo['vol_ratio']:.2f}배"
@@ -3962,6 +3988,466 @@ def _pattern_strategy(pattern: Dict, unit: str = '') -> List[str]:
             lines.append(f"상단/하단 분기선: {fmt_price(breakout)}{unit} / {fmt_price(invalid)}{unit}.")
 
     return [x for x in lines if x]
+
+# ════════════════════════════════════════════════════════════════════════════
+# [PATTERN v23.30] 차트 패턴 고도화 — 마스터 통계 엔진 + 거래량 규칙 + 신규 감지기 8종
+#  - PATTERN_STATS: 패턴별 검증 통계 (부코우스키 2020 업데이트, "perfect trade" 기준)
+#    * 실패율 = 돌파 시가 "최소 5% 이상" 못 가고 되돌린 비율 (부코우스키 표준 정의)
+#    * 평균 변동 = 돌파 다음날 출발가 → 20% 되돌림 전 최고/최저점
+#    * 투로우백(상승돌파)/풀백(하락이탈) = 돌파 후 재테스트 빈도
+#  - _pivot_volume_profile: 패턴 내부 거래량 시그니처 (어깨 수축/깃발 수축/핸들 수축)
+#  - _score_pattern_confidence: 신뢰도 = 기저 + 거래량 + 높이/ATR + 레짐 적합 + 돌파 거래량 (0~95)
+#  - 신규 감지기: 라운드바텀/라운드탑, 상승/하락채널, 스파이톱, 삼병선/삼구주선, 갭(브레이크어웨이/고갈)
+# ════════════════════════════════════════════════════════════════════════════
+
+PATTERN_STATS: Dict[str, Dict] = {
+    '더블탑':       {'avg_pct': -17, 'fail_pct': 16, 'throwback_pct': 48, 'target_hit_pct': 44, 'rank_txt': '하락패턴 17/21', 'vol_rule': '2차 고점에서 거래량 수축이 전형적이며, 돌파(넥라인 이탈) 시 거래량 증가 확인', 'note': '두 고점이 5% 이상 차이 나면 신뢰도 급락 — 유사한 고점이 핵심'},
+    '더블바텀':     {'avg_pct': 37, 'fail_pct': 15, 'throwback_pct': 64, 'target_hit_pct': 63, 'rank_txt': '상승패턴 5/39', 'vol_rule': '2차 저점에서 거래량 수축(매도력 소진) → 돌파 시 급증', 'note': 'Eve&Eve(유사 저점) 버전이 통계적으로 가장 우수'},
+    '헤드앤숄더':  {'avg_pct': -16, 'fail_pct': 19, 'throwback_pct': 68, 'target_hit_pct': 51, 'rank_txt': '하락패턴 9/36', 'vol_rule': '좌어깨 > 머리 > 우어깨로 거래량이 줄면 양질 — 우어깨에서 급증은 분배 경고', 'note': '넥라인 풀백(58~68%)이 흔함 — 2차 진입 기회'},
+    '역헤드앤숄더': {'avg_pct': 38, 'fail_pct': 11, 'throwback_pct': 66, 'target_hit_pct': 67, 'rank_txt': '상승패턴 10/39 (실패율 최저권)', 'vol_rule': '우어깨에서 거래량 수축, 넥라인 돌파 시 급증 필수', 'note': '상승 패턴 중 최저 실패율(11%) — 통계적으로 가장 견고한 반전'},
+    '트리플탑':     {'avg_pct': -19, 'fail_pct': 16, 'throwback_pct': None, 'target_hit_pct': None, 'rank_txt': '하락패턴 12/21', 'vol_rule': '3차 고점까지 거래량 감소가 전형적', 'note': None},
+    '트리플바텀':   {'avg_pct': 38, 'fail_pct': 10, 'throwback_pct': None, 'target_hit_pct': None, 'rank_txt': '상승패턴 4/39', 'vol_rule': '3차 저점에서 거래량 수축', 'note': None},
+    '상승삼각형':   {'avg_pct': 43, 'fail_pct': 15, 'throwback_pct': None, 'target_hit_pct': 70, 'rank_txt': '상승패턴 16/39', 'vol_rule': '삼각형 내 수축 → 돌파 시 거래량 급증 없으면 의심(가짜돌파)', 'note': '약 27%는 상방이 아닌 하방 이탈 — 방향을 가정하지 말고 종가 확인 필수'},
+    '하락삼각형':   {'avg_pct': -17, 'fail_pct': 16, 'throwback_pct': None, 'target_hit_pct': None, 'rank_txt': '하락패턴', 'vol_rule': '삼각형 내 거래량 수축', 'note': '놀랍게도 약 36%는 상방 돌파 — 매도함정에 유의'},
+    '대칭삼각형':   {'avg_pct': 20, 'fail_pct': 25, 'throwback_pct': None, 'target_hit_pct': None, 'rank_txt': '실패율 최하위권(양방향)', 'vol_rule': '수축이 핵심', 'note': '방향은 5:5 — "곧 방향 결정"만 의미하는 패턴'},
+    '하락쐐기형':   {'avg_pct': 21, 'fail_pct': 15, 'throwback_pct': None, 'target_hit_pct': None, 'rank_txt': '상승돌파 기준', 'vol_rule': '수축이 전형적', 'note': '하락 중 형성돼도 상방 돌파가 정석 — 반전 패턴'},
+    '상승쐐기형':   {'avg_pct': -22, 'fail_pct': 20, 'throwback_pct': None, 'target_hit_pct': None, 'rank_txt': '하락이탈 기준', 'vol_rule': '수축이 전형적', 'note': '상승 중 형성돼도 하방 이탈이 정석 — 반전 패턴'},
+    '상승깃발형':   {'avg_pct': 23, 'fail_pct': 12, 'throwback_pct': None, 'target_hit_pct': None, 'rank_txt': '지속패턴 (high-tight flag 30/39)', 'vol_rule': '깃발대(폴)에 거래량 급증 → 깃발 내 수축 → 돌파 시 재급증. 깃발 내 거래량이 높으면 분배', 'note': '깃발이 너무 길면(>4~8주) 실패율 상승'},
+    '하락깃발형':   {'avg_pct': -16, 'fail_pct': 15, 'throwback_pct': None, 'target_hit_pct': None, 'rank_txt': '지속패턴', 'vol_rule': '상승깃발과 반대 방향 — 깃발 내 수축', 'note': None},
+    '컵앤핸들':     {'avg_pct': 54, 'fail_pct': 5, 'throwback_pct': 62, 'target_hit_pct': 61, 'rank_txt': '상승패턴 3/39 (913 페펙트 트레이드)', 'vol_rule': '핸들에서 수축 → 돌파 시 평균 대비 40~50% 이상 증가가 정석(오닐)', 'note': '컵 깊이 15~33%가 전형적, V자가 아닌 U자(둥근 바닥)여야 함'},
+    '역컵앤핸들':   {'avg_pct': -17, 'fail_pct': 18, 'throwback_pct': 67, 'target_hit_pct': 62, 'rank_txt': '하락패턴 6/36', 'vol_rule': '컵앤핸들 미러 — 반등 손잡이에서 수축', 'note': '베어마켓에서 가장 강함(실패율 2%)'},
+    '라운드바텀':   {'avg_pct': 48, 'fail_pct': 4, 'throwback_pct': 64, 'target_hit_pct': 65, 'rank_txt': '상승패턴 7/39, 실패율 랭킹 1위 (990 트레이드)', 'vol_rule': '사각(사ucer) 중간에서 거래량 극소화 → 우측 상승 시 증가', 'note': '연간 가격대 중3 분위에서 돌파하면 최고 성과 — 중간 반등 후 재하락에 유의'},
+    '라운드탑':     {'avg_pct': -17, 'fail_pct': 20, 'throwback_pct': 58, 'target_hit_pct': None, 'rank_txt': '하락패턴 3/36 (상방돌파는 2/39)', 'vol_rule': '우측 리모로 갈수록 수축', 'note': '하방 이탈이 정석이지만 상방 돌파 시 +55%로 더 큼 (950+ 트레이드)'},
+    '상승채널':     {'avg_pct': None, 'fail_pct': None, 'throwback_pct': None, 'target_hit_pct': None, 'rank_txt': '지속패턴 (마스터 규칙)', 'vol_rule': '거래량 안정 또는 증가 — 하단선 리테스트 시 수축이 건강', 'note': '측정 목표 = 채널 폭을 돌파점에 더한 값'},
+    '하락채널':     {'avg_pct': None, 'fail_pct': None, 'throwback_pct': None, 'target_hit_pct': None, 'rank_txt': '지속패턴 (마스터 규칙)', 'vol_rule': '거래량 안정 또는 감소 — 상단선 리테스트 시 수축이 건강', 'note': '측정 목표 = 채널 폭을 이탈점에서 뺀 값'},
+    '스파이톱':     {'avg_pct': None, 'fail_pct': None, 'throwback_pct': None, 'target_hit_pct': None, 'rank_txt': '하락 반전 (실전 관측)', 'vol_rule': '.spike 정상에 거래량 스파이크 동반 시 유의', 'note': '급격 정상 이후 베이스 형성 — 베이스 이탈 시 측정 목표 도달 확률 높음'},
+    '삼병선':       {'avg_pct': None, 'fail_pct': None, 'throwback_pct': None, 'target_hit_pct': None, 'rank_txt': '타이밍 패턴 (니슨)', 'vol_rule': '3개 양봉을 따라 거래량 증가가 이상적', 'note': '지지선까지의 되돌림 후 출현 시 품질 최고'},
+    '삼구주선':     {'avg_pct': None, 'fail_pct': None, 'throwback_pct': None, 'target_hit_pct': None, 'rank_txt': '타이밍 패턴 (니슨)', 'vol_rule': '3개 음봉을 따라 거래량 증가가 이상적', 'note': '저항선까지의 반등 후 출현 시 품질 최고'},
+    '브레이크어웨이 갭': {'avg_pct': None, 'fail_pct': None, 'throwback_pct': None, 'target_hit_pct': None, 'rank_txt': '갭 (마스터 규칙)', 'vol_rule': '평균 대비 큰 거래량 동반 필수 — 없는 갭은 신뢰도 낮음', 'note': '추세 방향의 갭은 지속, 갭 충전은 피로 신호(단기)'},
+    '고갈 갭':     {'avg_pct': None, 'fail_pct': None, 'throwback_pct': None, 'target_hit_pct': None, 'rank_txt': '갭 (마스터 규칙)', 'vol_rule': '거래량 스파이크 동반 — 클라이맥스 매수/매도', 'note': '극단부 반대방향 갭 — 갭 충전이 흔하므로 반전 시그널로 주목'},
+}
+
+# [PATTERN v23.30] 반전 패턴 집합 — 박스권 레짐에서 "레인지 브레이크" 신호로 부가 평가
+REVERSAL_PATTERN_NAMES = {'더블탑', '더블바텀', '헤드앤숄더', '역헤드앤숄더', '트리플탑', '트리플바텀', '라운드바텀', '라운드탑', '스파이톱'}
+
+
+def _pattern_stats_line(name: str) -> str:
+    """패턴별 검증 통계 1줄 (없으면 빈 문자열)."""
+    st = PATTERN_STATS.get(name)
+    if not st:
+        return ""
+    a = st.get('avg_pct'); f = st.get('fail_pct'); t = st.get('throwback_pct'); h = st.get('target_hit_pct')
+    if a is None and f is None:
+        return f"통계: {st.get('rank_txt', '—')} (규칙 기반 참고 — 수치 통계 미보유)"
+    bits = []
+    if a is not None:
+        bits.append(f"평균 변동 {a:+d}%")
+    if f is not None:
+        bits.append(f"실패율 {f}%")
+    if t is not None:
+        bits.append(f"투로우백 {t}%")
+    if h is not None:
+        bits.append(f"목표 도달 {h}%")
+    return "통계(부코우스키 2020): " + " · ".join(bits)
+
+
+def _pivot_volume_profile(sub: pd.DataFrame, pattern: Dict) -> tuple:
+    """[PATTERN v23.30] 패턴 내부 거래량 시그니처 → (조정점, 라벨)
+    마스터 규칙: (1) 피벗 패턴 — 우측 피벗으로 갈수록 수축 = 매도/매수력 소진(양질)
+                 (2) 깃발 — 채널 내 수축 (3) 컵핸들 — 핸들 수축."""
+    pts = pattern.get('points') or []
+    name = pattern.get('name', '')
+    if len(sub) == 0:
+        return 0.0, ""
+    vols = sub['Volume'].astype(float).fillna(0)
+    n = len(sub)
+
+    def v_at(idx: int) -> float:
+        return float(vols.iloc[min(max(int(idx), 0), n - 1)])
+
+    Hs = [p for p in pts if p.get('type') == 'H']
+    Ls = [p for p in pts if p.get('type') == 'L']
+    if name in {'더블탑', '헤드앤숄더', '트리플탑', '라운드탑'} and len(Hs) >= 2:
+        seq = Hs
+    elif name in {'더블바텀', '역헤드앤숄더', '트리플바텀', '라운드바텀'} and len(Ls) >= 2:
+        seq = Ls
+    else:
+        seq = None
+    if seq:
+        half = max(1, len(seq) // 2)
+        vL = float(np.mean([v_at(p['idx']) for p in seq[:half]]))
+        vR = float(np.mean([v_at(p['idx']) for p in seq[half:]]))
+        if vL > 0 and vR < vL * 0.85:
+            return 5.0, "우측 피벗에서 거래량 수축 (소진 시그니처 — 품질 상)"
+        if vL > 0 and vR > vL * 1.25:
+            return -4.0, "우측 피벗에서 거래량 급증 (추격/분배 리스크)"
+        return 0.0, "패턴 내 거래량 중립"
+    if name in {'상승깃발형', '하락깃발형'} and n >= 24:
+        fl = vols.tail(12)
+        h1 = float(fl.iloc[:6].mean()); h2 = float(fl.iloc[6:].mean())
+        if h1 > 0 and h1 > h2 * 1.2:
+            return 4.0, "깃발 내부 거래량 수축 (정상 깃발)"
+        if h2 > h1 * 1.3:
+            return -4.0, "깃발 내부 고거래량 지속 (분배 가능성)"
+    if name in {'컵앤핸들', '역컵앤핸들'} and n >= 36:
+        hd = float(vols.tail(8).mean()); cpv = float(vols.iloc[-36:-8].mean())
+        if cpv > 0 and hd < cpv * 0.8:
+            return 4.0, "핸들에서 거래량 수축 (정상 핸들)"
+    return 0.0, ""
+
+
+def _pattern_height_atr(sub: pd.DataFrame, pattern: Dict, atr_pct_med: float):
+    """[PATTERN v23.30] 패턴 높이(돌파-무효화 간격) vs ATR% — 노이즈 패턴 필터 → (조정점, 라벨)"""
+    bo, iv = pattern.get('breakout'), pattern.get('invalidation')
+    if bo is None or iv is None:
+        u, l = pattern.get('upper_line'), pattern.get('lower_line')
+        if u and l:
+            xn = len(sub) - 1
+            bo, iv = _line_y(u, xn), _line_y(l, xn)
+    if bo is None or iv is None or atr_pct_med <= 0:
+        return 0.0, ""
+    cp = float(sub['Close'].iloc[-1])
+    h_pct = abs(float(bo) - float(iv)) / (cp + 1e-9) * 100.0
+    if h_pct >= atr_pct_med * 3:
+        return 4.0, f"패턴 높이 {h_pct:.1f}% ≥ ATR 3배 (실질 움직임 — 노이즈 아님)"
+    if h_pct < atr_pct_med * 1.5:
+        return -8.0, f"패턴 높이 {h_pct:.1f}% < ATR 1.5배 (노이즈 수준 — 신뢰도 강하)"
+    return 0.0, ""
+
+
+def _score_pattern_confidence(patterns: List[Dict], sub: pd.DataFrame, ind: Dict) -> List[Dict]:
+    """[PATTERN v23.30] 신뢰도 엔진 — 기저 점수 + 거래량 + 높이/ATR + 레짐 적합 + 돌파 거래량 (0~95 클립).
+    기존 하드코딩 값은 '기저'로 유지해 모든 패턴에 일관된 보정 적용."""
+    if not patterns or len(sub) == 0:
+        return patterns
+    close = ind.get('close')
+    atr = ind.get('atr')
+    atr_pct_med = 0.0
+    if close is not None and atr is not None and len(close) > 10 and len(atr) > 10:
+        try:
+            atr_pct_med = float((atr / (close + 1e-9)).tail(min(60, len(close))).median()) * 100.0
+        except Exception:
+            atr_pct_med = 0.0
+    regime = None
+    try:
+        regime = market_regime(ind)
+    except Exception:
+        regime = None
+    trend_score = int(regime.get('trend_score', 0)) if regime else 0
+    ema_up = None
+    if regime:
+        try:
+            ema_up = float(regime.get('ema20', 0)) > float(regime.get('ema60', 0))
+        except Exception:
+            ema_up = None
+    for p in patterns:
+        base = float(p.get('confidence', 50.0))
+        vadj, vlabel = _pivot_volume_profile(sub, p)
+        hadj, hlabel = _pattern_height_atr(sub, p, atr_pct_med)
+        radj, rlabel = 0.0, ""
+        d = p.get('direction', '중립')
+        if regime and d in ('상승', '하락') and ema_up is not None:
+            _adx_v = float(regime.get('adx', 0))
+            _ema20_v = float(regime.get('ema20', 0))
+            _close_v = float(close.iloc[-1]) if close is not None and len(close) else 0.0
+            _bull_strong = trend_score >= 4 and ema_up
+            _bear_strong = _adx_v > 20 and (not ema_up) and _close_v < _ema20_v
+            _bull_against = trend_score >= 4 and ema_up and _close_v > _ema20_v
+            if d == '상승' and _bull_strong:
+                radj, rlabel = 4.0, "단기 상승추세와 정렬 (trend_score 4+) — 지속 신뢰도 상승"
+            elif d == '하락' and _bear_strong:
+                radj, rlabel = 4.0, "단기 하락추세와 정렬 (EMA 역배열 + ADX) — 지속 신뢰도 상승"
+            elif d == '하락' and _bull_against:
+                radj, rlabel = -6.0, "역추세 패턴 (상승추세 중 하락패턴) — 통계상 신뢰도 강하"
+            elif d == '상승' and _bear_strong:
+                radj, rlabel = -6.0, "역추세 패턴 (하락추세 중 상승패턴) — 통계상 신뢰도 강하"
+        if regime and regime.get('regime') == '박스권' and p.get('name') in REVERSAL_PATTERN_NAMES:
+            radj += 2.0
+            rlabel = (rlabel + " + " if rlabel else "") + "박스권 반전대 — 레인지 브레이크 신호로 주목"
+        badj, blabel = 0.0, ""
+        bo = p.get('breakout_info')
+        if bo:
+            if bo.get('vol_confirmed'):
+                badj, blabel = 5.0, "돌파 거래량 확인 (≥1.25배)"
+            elif float(bo.get('vol_ratio', 1.0)) < 0.8:
+                badj, blabel = -5.0, "돌파 거래량 <0.8배 (가짜돌파 리스크)"
+        final = float(np.clip(base + vadj + hadj + radj + badj, 0.0, 95.0))
+        p['confidence'] = round(final, 1)
+        p['conf_parts'] = {'base': round(base, 1), 'volume': vadj, 'height_atr': hadj, 'regime': radj, 'breakout': badj}
+        p['vol_label'] = vlabel
+        p['height_label'] = hlabel
+        p['regime_label'] = rlabel
+        p['breakout_label'] = blabel
+    return patterns
+
+
+def _detect_rounding(sub: pd.DataFrame, cp: float) -> List[Dict]:
+    """[PATTERN v23.30] 라운드바텀(사각)/라운드탑 — 2차 곡선 적합(U형 테스트) + 리모 유사성 + 트러프/피크 깊이 + 거래량 수축.
+    부코우스키: 라운드바텀 실패율 4% (상승패턴 실패율 랭킹 1위, 990 트레이드)."""
+    out: List[Dict] = []
+    n = len(sub)
+    if n < 40:
+        return out
+    W = min(70, n)
+    c = sub['Close'].astype(float).values[-W:]
+    lo, hi = float(c.min()), float(c.max())
+    rng = hi - lo
+    if rng <= cp * 0.05:  # 폭이 너무 평평한 박스권 — 사ucer 아님
+        return out
+    x = np.arange(W)
+    z = (c - lo) / (rng + 1e-9)
+    try:
+        coef = np.polyfit(x, z, 2)
+    except Exception:
+        return out
+    zhat = np.polyval(coef, x)
+    ss_res = float(((z - zhat) ** 2).sum())
+    ss_tot = float(((z - z.mean()) ** 2).sum())
+    r2 = 1.0 - ss_res / (ss_tot + 1e-9)
+    if r2 < 0.55:
+        return out
+    a2, b2, _c2 = coef
+    vol = sub['Volume'].astype(float).fillna(0).values[-W:]
+    i0 = n - W
+    if a2 > 0:
+        trough_x = int(min(max(round(-b2 / (2 * a2)), 0), W - 1))
+        if not (W * 0.25 <= trough_x <= W * 0.75):
+            return out
+        rim_l, rim_r = float(c[0]), float(c[-1])
+        if _pct_similarity(rim_l, rim_r) > 0.08:
+            return out
+        if lo > min(rim_l, rim_r) * 0.92:  # 깊이 ≥8%
+            return out
+        vtr = float(vol[max(0, trough_x - 3):trough_x + 4].mean())
+        vavg = float(vol.mean())
+        vol_dry = vavg > 0 and vtr < vavg * 0.8
+        breakout = max(rim_l, rim_r)
+        conf = 70.0 + (4 if vol_dry else 0) + (3 if cp >= breakout else 0)
+        pts = [
+            {'idx': i0, 'type': 'H', 'price': rim_l, 'date': sub.index[i0]},
+            {'idx': i0 + trough_x, 'type': 'L', 'price': lo, 'date': sub.index[i0 + trough_x]},
+            {'idx': n - 1, 'type': 'H', 'price': rim_r, 'date': sub.index[-1]},
+        ]
+        out.append({'name': '라운드바텀', 'direction': '상승', 'confidence': round(conf, 1),
+                    'breakout': breakout, 'invalidation': lo, 'target': breakout + (breakout - lo),
+                    'summary': '장기간 둥글게 바닥을 만드느 사ucer(라운드) 바닥 — 통계상 실패율 4%로 최저권인 상승 반전 패턴입니다. 사ucer 림 상단 종가 돌파가 확인 신호입니다.',
+                    'points': pts})
+    else:
+        peak_x = int(min(max(round(-b2 / (2 * a2)), 0), W - 1))
+        if not (W * 0.25 <= peak_x <= W * 0.75):
+            return out
+        rim_l, rim_r = float(c[0]), float(c[-1])
+        if _pct_similarity(rim_l, rim_r) > 0.08:
+            return out
+        if hi < max(rim_l, rim_r) * 1.08:  # 깊이 ≥8%
+            return out
+        vpk = float(vol[max(0, peak_x - 3):peak_x + 4].mean())
+        vavg = float(vol.mean())
+        vol_dry = vavg > 0 and vpk < vavg * 0.8
+        breakout = min(rim_l, rim_r)
+        conf = 68.0 + (4 if vol_dry else 0) + (3 if cp <= breakout else 0)
+        pts = [
+            {'idx': i0, 'type': 'L', 'price': rim_l, 'date': sub.index[i0]},
+            {'idx': i0 + peak_x, 'type': 'H', 'price': hi, 'date': sub.index[i0 + peak_x]},
+            {'idx': n - 1, 'type': 'L', 'price': rim_r, 'date': sub.index[-1]},
+        ]
+        out.append({'name': '라운드탑', 'direction': '하락', 'confidence': round(conf, 1),
+                    'breakout': breakout, 'invalidation': hi, 'target': breakout - (hi - breakout),
+                    'summary': '장기간 둥글게 천장을 만들다 ∩형(라운드) 탑 — 하방 이탈이 정석인 하락 반전 패턴입니다. 리모 하단 종가 이탈이 확인 신호입니다.',
+                    'points': pts})
+    return out
+
+
+def _detect_parallel_channel(sub: pd.DataFrame, highs_p: List[Dict], lows_p: List[Dict], cp: float) -> List[Dict]:
+    """[PATTERN v23.30] 상승/하락채널 — 상·하단 추세선이 평행(기울기 동일 방향) + 각 3회 이상 터치 + 수렴 없음.
+    삼각형/쐐기(수렴)와 구분: 채널은 폭 유지(확장 아님) + 명확한 기울기."""
+    out: List[Dict] = []
+    if len(highs_p) < 3 or len(lows_p) < 3:
+        return out
+    n = len(sub)
+    upper = _fit_line_from_pivots(highs_p)
+    lower = _fit_line_from_pivots(lows_p)
+    if not upper or not lower:
+        return out
+    x0 = float(min(highs_p[0]['idx'], lows_p[0]['idx']))
+    x1 = float(max(highs_p[-1]['idx'], lows_p[-1]['idx']))
+    su = upper[0] / (cp + 1e-9)
+    sl = lower[0] / (cp + 1e-9)
+    if abs(su) < 0.0006 or abs(sl) < 0.0006:  # 기울기 미미(박스권) — 채널 아님
+        return out
+    if su * sl < 0:  # 반대 기울기 = 삼각형/쐐기 영역
+        return out
+    w0 = _line_y(upper, x0) - _line_y(lower, x0)
+    w1 = _line_y(upper, x1) - _line_y(lower, x1)
+    if w1 < w0 * 0.95:  # 수렴 → 삼각형/쐐기 감지기가 담당
+        return out
+    if w1 > w0 * 1.15:  # 확장 → 브로드닝 영역(무시)
+        return out
+    xn = float(n - 1)
+    up_now, lo_now = _line_y(upper, xn), _line_y(lower, xn)
+    if su > 0:
+        d, bo, inv, tgt = '상승', up_now, lo_now, up_now + w0
+        summ = '상·하단선에 3회 이상 터치하는 상승 평행 채널 — 전형적인 상승 지속 패턴입니다. 상단선 종가 돌파가 지속 신호, 하단선 이탈이 무효화입니다.'
+        nm = '상승채널'
+    else:
+        d, bo, inv, tgt = '하락', lo_now, up_now, lo_now - w0
+        summ = '상·하단선에 3회 이상 터치하는 하락 평행 채널 — 전형적인 하락 지속 패턴입니다. 하단선 종가 이탈이 지속 신호, 상단선 돌파가 무효화입니다.'
+        nm = '하락채널'
+    out.append({'name': nm, 'direction': d, 'confidence': 72.0 + (2.0 if len(highs_p) + len(lows_p) >= 7 else 0.0),
+                'breakout': bo, 'invalidation': inv, 'target': tgt, 'summary': summ,
+                'points': (highs_p + lows_p)[-6:], 'upper_line': upper, 'lower_line': lower})
+    return out
+
+
+def _detect_spire_top(sub: pd.DataFrame, cp: float) -> Optional[Dict]:
+    """[PATTERN v23.30] 스파이톱 — 급격한 스파이크 정상 + 그 아래 베이스 형성 (하락 반전).
+    정상 대비 6% 이상 두드러진 스파이크, 이후 베이스가 정상 6% 이상 아래에서 유지."""
+    n = len(sub)
+    if n < 25:
+        return None
+    h = sub['High'].astype(float).values
+    W = min(30, n)
+    hh = h[-W:]
+    spike_i = int(np.argmax(hh))
+    spike = float(hh[spike_i])
+    left_w = hh[:spike_i]
+    if len(left_w) < 3 or spike_i >= W - 5:  # 스파이크는 최근(베시가 5봉 이상)이어야 함
+        return None
+    base_hi = float(np.max(hh[spike_i + 1:]))
+    if spike / float(np.max(left_w)) - 1 < 0.06:
+        return None
+    if base_hi > spike * 0.94:
+        return None
+    breakout = base_hi
+    target = breakout - (spike - breakout)
+    pts = [
+        {'idx': n - W, 'type': 'H', 'price': float(np.max(left_w)), 'date': sub.index[n - W]},
+        {'idx': n - W + spike_i, 'type': 'H', 'price': spike, 'date': sub.index[n - W + spike_i]},
+        {'idx': n - 1, 'type': 'H', 'price': base_hi, 'date': sub.index[-1]},
+    ]
+    return {'name': '스파이톱', 'direction': '하락', 'confidence': 64.0,
+            'breakout': breakout, 'invalidation': spike, 'target': target,
+            'summary': '급격한 스파이크 정상 이후 정상 아래에서 베이스가 형성된 스파이톱 — 매수 피로(클라이맥스) 후의 하락 반전 패턴입니다. 베이스 상단 이탈 시 하락이 확인됩니다.',
+            'points': pts}
+
+
+def _detect_three_candles(sub: pd.DataFrame, ind: Dict) -> List[Dict]:
+    """[PATTERN v23.30] 삼병선(양)/삼구주선(음) — 니슨 3봉 타이밍 패턴.
+    규칙: 연속 3개 동일 방향 실체, 각 오픈이 직전 봉 몸통 내부, 종가 근방 마감(꼬리 짧음), 종가 스텝."""
+    out: List[Dict] = []
+    if len(sub) < 20:
+        return out
+    c = sub['Close'].astype(float)
+    o = sub['Open'].astype(float)
+    h = sub['High'].astype(float)
+    l = sub['Low'].astype(float)
+    a = ind.get('atr')
+    try:
+        atr = float(a.iloc[-1]) if a is not None and len(a) > 0 else 0.0
+    except Exception:
+        atr = 0.0
+    if atr <= 0:
+        atr = float((h - l).tail(14).mean())
+    i0, i1, i2 = len(sub) - 3, len(sub) - 2, len(sub) - 1
+    b0, b1, b2 = float(c.iloc[i0] - o.iloc[i0]), float(c.iloc[i1] - o.iloc[i1]), float(c.iloc[i2] - o.iloc[i2])
+
+    def _body_ok(b: float) -> bool:
+        return abs(b) >= atr * 0.8
+
+    def _open_inside(o_prev_lo: float, o_prev_hi: float, o_cur: float) -> bool:
+        return min(o_prev_lo, o_prev_hi) <= o_cur <= max(o_prev_lo, o_prev_hi)
+
+    # 삼병선: 3개 양봉
+    if (b0 > 0 and b1 > 0 and b2 > 0
+            and _body_ok(b0) and _body_ok(b1) and _body_ok(b2)
+            and _open_inside(o.iloc[i0], c.iloc[i0], o.iloc[i1])
+            and _open_inside(o.iloc[i1], c.iloc[i1], o.iloc[i2])
+            and float(c.iloc[i0]) < float(c.iloc[i1]) < float(c.iloc[i2])
+            and float(o.iloc[i0] - l.iloc[i0]) <= b0 * 0.6
+            and float(o.iloc[i1] - l.iloc[i1]) <= b1 * 0.6
+            and float(o.iloc[i2] - l.iloc[i2]) <= b2 * 0.6):
+        ctx = float(c.iloc[i2]) < float(h.tail(20).max()) * 0.97  # 되돌림 후 출현
+        conf = 66.0 + (6.0 if ctx else 0.0)
+        out.append({'name': '삼병선', 'direction': '상승', 'confidence': conf,
+                    'breakout': float(h.tail(3).max()), 'invalidation': float(l.tail(3).min()), 'target': None,
+                    'summary': '연속 3개 강한 양봉(각 오픈이 직전 몸통 내부, 고가 부근 마감) — 니슨의 대표 양성 타이밍 패턴입니다. 지지선 되돌림 후 출현 시 품질이 최고입니다.' if ctx else
+                               '연속 3개 강한 양봉(각 오픈이 직전 몸통 내부, 고가 부근 마감) — 니슨의 대표 양성 타이밍 패턴입니다.',
+                    'points': []})
+    # 삼구주선: 3개 음봉
+    if (b0 < 0 and b1 < 0 and b2 < 0
+            and _body_ok(b0) and _body_ok(b1) and _body_ok(b2)
+            and _open_inside(o.iloc[i0], c.iloc[i0], o.iloc[i1])
+            and _open_inside(o.iloc[i1], c.iloc[i1], o.iloc[i2])
+            and float(c.iloc[i0]) > float(c.iloc[i1]) > float(c.iloc[i2])
+            and float(h.iloc[i0] - o.iloc[i0]) <= abs(b0) * 0.6
+            and float(h.iloc[i1] - o.iloc[i1]) <= abs(b1) * 0.6
+            and float(h.iloc[i2] - o.iloc[i2]) <= abs(b2) * 0.6):
+        ctx = float(c.iloc[i2]) > float(l.tail(20).min()) * 1.03  # 반등 후 출현
+        conf = 66.0 + (6.0 if ctx else 0.0)
+        out.append({'name': '삼구주선', 'direction': '하락', 'confidence': conf,
+                    'breakout': float(l.tail(3).min()), 'invalidation': float(h.tail(3).max()), 'target': None,
+                    'summary': '연속 3개 강한 음봉(각 오픈이 직전 몸통 내부, 저가 부근 마감) — 니슨의 대표 음성 타이밍 패턴입니다. 저항선 반등 후 출현 시 품질이 최고입니다.' if ctx else
+                               '연속 3개 강한 음봉(각 오픈이 직전 몸통 내부, 저가 부근 마감) — 니슨의 대표 음성 타이밍 패턴입니다.',
+                    'points': []})
+    return out
+
+
+def _detect_gap_signal(sub: pd.DataFrame, ind: Dict, cp: float) -> List[Dict]:
+    """[PATTERN v23.30] 갭 신호 — 브레이크어웨이 갭(지속) / 고갈 갭(경고).
+    최근 10봉 내 갭(오늘 low > 어제 high / 오늘 high < 어제 low) + 최소 크기(ATR 0.5배).
+    코인은 24/7이므로 과정보다 "가격 공백대"로 해석 — 갭 충전이 흔하다는 점을 고려."""
+    out: List[Dict] = []
+    if len(sub) < 25:
+        return out
+    h = sub['High'].astype(float)
+    l = sub['Low'].astype(float)
+    c = sub['Close'].astype(float)
+    v = sub['Volume'].astype(float).fillna(0)
+    v20 = v.rolling(20, min_periods=1).mean()
+    a = ind.get('atr')
+    try:
+        atr = float(a.iloc[-1]) if a is not None and len(a) > 0 else 0.0
+    except Exception:
+        atr = 0.0
+    if atr <= 0:
+        atr = float((h - l).tail(14).mean())
+    n = len(sub)
+    min_gap = atr * 0.5
+    for i in range(n - 1, max(n - 11, 2), -1):
+        if float(l.iloc[i]) > float(h.iloc[i - 1]) + min_gap:  # 갭 업
+            gap_lo, gap_hi = float(h.iloc[i - 1]), float(l.iloc[i])
+            vol_r = float(v.iloc[i] / (v20.iloc[i] + 1e-9))
+            prior_ret = float(c.iloc[i - 1] / (c.iloc[max(i - 11, 0)] + 1e-9) - 1)
+            pts = [{'idx': i, 'type': 'H', 'price': gap_hi, 'date': sub.index[i]}]
+            if prior_ret > 0.03 and vol_r >= 1.3:
+                out.append({'name': '브레이크어웨이 갭', 'direction': '상승', 'confidence': 68.0,
+                            'breakout': gap_hi, 'invalidation': gap_lo, 'target': gap_hi + (gap_hi - gap_lo),
+                            'summary': f'추세 방향(전 10봉 +{prior_ret * 100:.1f}%)의 갭이 거래량 {vol_r:.1f}배와 동반 — 브레이크어웨이 갭(지속 신호)입니다. 갭 하단까지의 충전은 단기 약세 신호로 봅니다.',
+                            'points': pts})
+            elif prior_ret < -0.03:
+                out.append({'name': '고갈 갭', 'direction': '하락', 'confidence': 62.0,
+                            'breakout': gap_lo, 'invalidation': gap_hi, 'target': gap_lo,
+                            'summary': f'하락 추세(전 10봉 {prior_ret * 100:.1f}%) 끝에서의 상방 갭 — 고갈(클라이맥스) 갭입니다. 갭 충전과 추세 피로 가능성을 함께 추적하세요.',
+                            'points': pts})
+            break
+        if float(h.iloc[i]) < float(l.iloc[i - 1]) - min_gap:  # 갭 다운
+            gap_lo, gap_hi = float(h.iloc[i]), float(l.iloc[i - 1])
+            vol_r = float(v.iloc[i] / (v20.iloc[i] + 1e-9))
+            prior_ret = float(c.iloc[i - 1] / (c.iloc[max(i - 11, 0)] + 1e-9) - 1)
+            pts = [{'idx': i, 'type': 'L', 'price': gap_lo, 'date': sub.index[i]}]
+            if prior_ret < -0.03 and vol_r >= 1.3:
+                out.append({'name': '브레이크어웨이 갭', 'direction': '하락', 'confidence': 68.0,
+                            'breakout': gap_lo, 'invalidation': gap_hi, 'target': gap_lo - (gap_hi - gap_lo),
+                            'summary': f'추세 방향(전 10봉 {prior_ret * 100:.1f}%)의 갭이 거래량 {vol_r:.1f}배와 동반 — 브레이크어웨이 갭(지속 신호)입니다. 갭 상단까지의 충전은 단기 반등 신호로 봅니다.',
+                            'points': pts})
+            elif prior_ret > 0.03:
+                out.append({'name': '고갈 갭', 'direction': '상승', 'confidence': 62.0,
+                            'breakout': gap_hi, 'invalidation': gap_lo, 'target': gap_hi,
+                            'summary': f'상승 추세(전 10봉 +{prior_ret * 100:.1f}%) 끝에서의 하방 갭 — 고갈(클라이맥스) 갭입니다. 갭 충전과 추세 피로 가능성을 함께 추적하세요.',
+                            'points': pts})
+            break
+    return out
+
 
 @st.cache_data(show_spinner=False, ttl=1800)  # [P1] 순수연산 캐시 — 결과 dict/df는 picklable, TTL 내 재호출 시 재계산 생략
 def analyze_chart_patterns(df: pd.DataFrame, ind: Dict, is_kr: bool = False, lookback: int = 140, max_age: int = 30, include_expired: bool = False) -> Dict:
@@ -4200,6 +4686,19 @@ def analyze_chart_patterns(df: pd.DataFrame, ind: Dict, is_kr: bool = False, loo
 
             add_pattern({'name': '역컵앤핸들', 'direction': '하락', 'confidence': 66.0 + (4 if cp <= right_l else 0), 'breakout': right_l, 'invalidation': handle_h, 'target': right_l - (top_m - right_l), 'summary': '둥근 천장 이후 짧은 반등 손잡이를 만들고 재하락을 노리는 패턴입니다.', 'points': []})
 
+    # [PATTERN v23.30] 마스터급 신규 감지기 8종 — 기존 15종과 동일 스키마(candidates → dedup → freshness 파이프라인 공용)
+    for _p in _detect_rounding(sub, cp):
+        add_pattern(_p)
+    for _p in _detect_parallel_channel(sub, highs, lows, cp):
+        add_pattern(_p)
+    _sp = _detect_spire_top(sub, cp)
+    if _sp:
+        add_pattern(_sp)
+    for _p in _detect_three_candles(sub, ind):
+        add_pattern(_p)
+    for _p in _detect_gap_signal(sub, ind, cp):
+        add_pattern(_p)
+
     dedup = {}
 
     for p in candidates:
@@ -4225,6 +4724,8 @@ def analyze_chart_patterns(df: pd.DataFrame, ind: Dict, is_kr: bool = False, loo
     patterns = list(dedup.values())
 
     patterns = _apply_pattern_freshness(patterns, sub, max_age=max_age, include_expired=include_expired)
+
+    patterns = _score_pattern_confidence(patterns, sub, ind)   # [FIX v23.30] 신뢰도 엔진 — 거래량 품질·높이/ATR·레짐 적합·돌파 거래량 보정
 
     for p in patterns:
 
@@ -4318,7 +4819,29 @@ def render_pattern_chart(df: pd.DataFrame, ind: Dict, pattern_result: Dict, titl
 
         # [CHART_TITLE_SEARCH: 차트 패턴 분석 (최신성 우선) / 대표 패턴 차트] 아래 [BOXPOS_003] 박스/풍선 위치 코드입니다. 이 차트 제목으로 검색하면 바로 찾을 수 있습니다.
         # [BOXPOS_003_PATTERN_render_pattern_chart] 패턴 차트: 좌상단 패턴 요약 배너 | 위치수정: x/y(기준좌표), ax/ay(화살표 박스 픽셀오프셋), xshift/yshift, xanchor/yanchor를 조정. xref/yref="paper"는 0~1 화면비율, xref/yref="x/y"는 날짜·가격/지표값입니다.
-        fig.add_annotation(x=0.01, xref='paper', y=0.98, yref='paper', text=f"<b>{best['name']}</b> · {best.get('direction','중립')} · {stage_txt} · 신뢰도 {best.get('confidence',0):.1f}{fresh_txt}", showarrow=False, xanchor='left', yanchor='bottom', bgcolor='rgba(5,9,17,0.92)', bordercolor=P['border2'], borderwidth=1, font=dict(color=P['txt'], family=FONT_MONO, size=11))
+        # [FIX v23.30] 배너 2행 — 마스터 통계(부코우스키) + 레짐 적합 + 돌파 거래량 배지
+
+        _v2330_extra_bits = []
+
+        _v2330_stl = _pattern_stats_line(best.get('name', ''))
+
+        if _v2330_stl:
+
+            _v2330_extra_bits.append(_v2330_stl)
+
+        if best.get('regime_label'):
+
+            _v2330_extra_bits.append(f"레짐: {best['regime_label']}")
+
+        _v2330_bo = best.get('breakout_info')
+
+        if _v2330_bo:
+
+            _v2330_extra_bits.append('거래량 ✓' if _v2330_bo.get('vol_confirmed') else '거래량 ✗')
+
+        _banner_extra = f"<br><span style='font-size:10px'>{(' | '.join(_v2330_extra_bits))}</span>" if _v2330_extra_bits else ""
+
+        fig.add_annotation(x=0.01, xref='paper', y=0.98, yref='paper', text=f"<b>{best['name']}</b> · {best.get('direction','중립')} · {stage_txt} · 신뢰도 {best.get('confidence',0):.1f}{fresh_txt}{_banner_extra}", showarrow=False, xanchor='left', yanchor='bottom', bgcolor='rgba(5,9,17,0.92)', bordercolor=P['border2'], borderwidth=1, font=dict(color=P['txt'], family=FONT_MONO, size=11))
 
     fig.add_trace(go.Bar(x=sub.index, y=sub['Volume'], marker_color=['rgba(255,77,109,0.55)' if c >= o else 'rgba(77,171,247,0.55)' for o, c in zip(sub['Open'], sub['Close'])], showlegend=False, hovertemplate='<b>거래량</b><br>날짜: %{x}<br>거래량: %{y:,.0f}<extra></extra>'), row=2, col=1)
     fig = add_series_current_marker(fig, sub, sub['Volume'], row=2, label="패턴 현재 거래량", panel="volume", ind=ind, color=P["warn"], price_fmt=",.0f")
